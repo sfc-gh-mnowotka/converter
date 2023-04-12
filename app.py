@@ -63,7 +63,7 @@ def convert(input_code: str) -> str:
     return clean_code
 
 
-st.title("Ipython -> Streamlit converter")
+st.title("Ipython ➡️ Streamlit converter")
 
 uploader = st.file_uploader("Upload *.ipynb file", type="ipynb")
 
