@@ -5,6 +5,7 @@ import matplotlib.colors as mcolors
 class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
     def __init__(self):
         self.ipywidgets_alias = "widgets"
+        self.file_upload_vars = {}
         self.fig_vars = []
         self.module_body = None
         self.converted_functions = {}
@@ -61,7 +62,7 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
                 # Add a separate import statement for streamlit
                 st_import = ast.Import(names=[ast.alias(name="streamlit", asname="st")])
                 self.module_body.insert(self.module_body.index(node) + 1, st_import)
-        return node
+        return self.generic_visit(node)
 
     def visit_Assign(self, node):
         if (
@@ -127,7 +128,7 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
                 if func.attr in self.supported_button_types:
                     self.transformed_variables.add(identifier)
                     return self._process_button(node)
-        return super().generic_visit(node)
+        return self.generic_visit(node)
 
     def visit_Expr(self, node):
         if (
@@ -190,9 +191,10 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
                 and node.value.func.value.id == "widgets"
             ):
                 return self._process_image(node, is_assign=False)
-        return node
+        return self.generic_visit(node)
 
     def visit_Attribute(self, node):
+        print("visiting attribute", node.value)
         if (
             isinstance(node.value, ast.Name)
             and node.value.id in self.transformed_variables
@@ -210,7 +212,29 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
         ):
             return ast.Name(id="st", ctx=ast.Load())
 
-        return node
+        if (
+            node.attr == "content"
+            and isinstance(node.value, ast.Subscript)
+            and isinstance(node.value.value, ast.Attribute)
+            and node.value.value.attr == "value"
+            and isinstance(node.value.value.value, ast.Name)
+            and node.value.value.value.id in self.file_upload_vars
+        ):
+            new_node = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(
+                        id=self.file_upload_vars[node.value.value.value.id],
+                        ctx=ast.Load(),
+                    ),
+                    attr="read",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[],
+            )
+            return new_node
+
+        return self.generic_visit(node)
 
     def visit_FunctionDef(self, node):
         self.converted_functions[node.name] = node
@@ -256,6 +280,18 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
             # Replace the original keyword arguments with the reordered ones
             node.keywords = reordered_kwargs
 
+        return self.generic_visit(node)
+
+    def visit_If(self, node):
+        if (
+            isinstance(node.test, ast.Attribute)
+            and node.test.attr == "value"
+            and isinstance(node.test.value, ast.Name)
+            and node.test.value.id in self.file_upload_vars
+        ):
+            node.test = ast.Name(
+                id=self.file_upload_vars[node.test.value.id], ctx=ast.Load()
+            )
         return self.generic_visit(node)
 
     def _is_ipywidgets_button(self, func):
@@ -376,7 +412,12 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
                 ast.keyword(arg="min", value=ast.Constant(value=min_value)),
                 ast.keyword(arg="max", value=ast.Constant(value=max_value)),
                 ast.keyword(arg="step", value=ast.Constant(value=step)),
-                ast.keyword(arg="value", value=ast.Constant(value=min_value if default_value is None else default_value)),
+                ast.keyword(
+                    arg="value",
+                    value=ast.Constant(
+                        value=min_value if default_value is None else default_value
+                    ),
+                ),
             ],
         )
 
@@ -442,30 +483,25 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
         return new_assign
 
     def _process_file_upload(self, node):
-        st_file_uploader = ast.Attribute(
-            value=ast.Name(id="st", ctx=ast.Load()),
-            attr="file_uploader",
-            ctx=ast.Load(),
+        var_name = node.targets[0].id
+        self.file_upload_vars[var_name] = var_name
+        description = None
+        for keyword in node.value.keywords:
+            if keyword.arg == "description":
+                description = keyword.value.s
+        new_node = ast.Assign(
+            targets=[ast.Name(id=self.file_upload_vars[var_name], ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="st", ctx=ast.Load()),
+                    attr="file_uploader",
+                    ctx=ast.Load(),
+                ),
+                args=[ast.Str(s=description)],
+                keywords=[],
+            ),
         )
-
-        keywords = []
-        description_found = any([kw.arg == "description" for kw in node.value.keywords])
-
-        for kw in node.value.keywords:
-            kw.arg = self.args_translation.get(kw.arg)
-            if not kw.arg:
-                continue
-            keywords.append(kw)
-
-        if not description_found:
-            keywords.append(ast.keyword(arg="label", value=ast.Str(s="")))
-
-        st_file_uploader_call = ast.Call(
-            func=st_file_uploader, args=[], keywords=keywords
-        )
-        new_assign = ast.Assign(targets=node.targets, value=st_file_uploader_call)
-        self.file_upload_variables.add(node.targets[0].id)  # Store the variable name
-        return new_assign
+        return new_node
 
     def _process_multiselect(self, node):
         st_multiselect = ast.Attribute(
@@ -821,7 +857,10 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
             raise ValueError(f"Function '{function_name}' not found in the module body")
 
         arg_defaults = {}
-        for arg, default in zip(function_def.args.args[-len(function_def.args.defaults):], function_def.args.defaults):
+        for arg, default in zip(
+            function_def.args.args[-len(function_def.args.defaults) :],
+            function_def.args.defaults,
+        ):
             arg_defaults[arg.arg] = default
 
         for kw in node.value.keywords:
@@ -836,7 +875,9 @@ class IpywidgetsToStreamlitTransformer(ast.NodeTransformer):
                 slider = self._convert_abbreviation_to_slider(slider, default_value)
 
             if isinstance(slider, ast.Tuple):
-                slider = self._convert_abbreviation_tuple_to_slider(slider, default_value)
+                slider = self._convert_abbreviation_tuple_to_slider(
+                    slider, default_value
+                )
 
             slider_attr = slider.keywords
 
